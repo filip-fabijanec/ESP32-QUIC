@@ -4,13 +4,17 @@ idf_component_register(
         "ngtcp2_sample.c" 
         "esp_ev_compat.c"
         "mqtt_quic_transport.c"
+        "hardware_control.c"
     PRIV_REQUIRES 
         spi_flash 
         nvs_flash
+        esp_timer
+        driver
+        dht
     REQUIRES 
         ngtcp2 
         wolfssl 
         coreMQTT
         protocol_examples_common
+        esp_adc
     INCLUDE_DIRS "")
-

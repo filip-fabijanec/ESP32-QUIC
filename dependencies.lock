@@ -1,34 +1,18 @@
 dependencies:
-  esp_timer:
-    dependencies: []
-    source:
-      path: /home/ubuntu/repo/esp/esp-idf/components/esp_timer
-      type: local
-    version: '*'
   idf:
     source:
       type: idf
-    version: 6.0.0
-  protocol_examples_common:
-    dependencies: []
-    source:
-      path: 
-        /home/ubuntu/repo/esp/esp-idf/examples/common_components/protocol_examples_common
-      type: local
-    version: '*'
+    version: 5.5.3
   wolfssl/wolfssl:
-    component_hash: 
-      b4ee661f0258f5353aa143754fd4c6577d743c9f9463aaa62b8a6f8f0916295b
+    component_hash: 4d619e882c19d967bbaa53302e3bd2bdb8c611b5efb13302171aace809fccfdf
     dependencies: []
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 5.8.0
+    version: 5.8.2~1
 direct_dependencies:
-- esp_timer
 - idf
-- protocol_examples_common
 - wolfssl/wolfssl
-manifest_hash: 178f1ba3bf37c757e5701202b9a767f86befbd38cf45e3809a034d5cb944a3ef
-target: esp32c3
+manifest_hash: 660be0bff7c504c9ded717f8a0585bc9a850202d4433015d205d244122039775
+target: esp32s3
 version: 2.0.0

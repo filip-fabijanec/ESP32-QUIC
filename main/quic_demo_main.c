@@ -13,6 +13,7 @@
 #include "esp_flash.h"
 #include "esp_system.h"
 
+extern SemaphoreHandle_t g_quic_mutex;
 
 #include <time.h>
 #include <sys/types.h>
@@ -43,7 +44,6 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
-
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
@@ -52,16 +52,24 @@
 #include "core_mqtt_state.h"
 #include "mqtt_quic_transport.h"
 
+#include "hardware_control.h"
+
+#include "driver/gpio.h"
+#define LED_PIN GPIO_NUM_4
+
 extern struct client g_client;
 
 static const char *TAG = "quic_demo_main";
 
-static uint8_t gbuffer[2048];  // Buffer for MQTT messages
+static uint8_t gbuffer[8192];  // Buffer for MQTT messages
+
+static volatile bool g_send_ack = false;
+static volatile bool g_send_sensors = false;
 
 // MQTT application callback
 static void eventCallback(MQTTContext_t *pContext,
-                         MQTTPacketInfo_t *pPacketInfo,
-                         MQTTDeserializedInfo_t *pDeserializedInfo)
+                          MQTTPacketInfo_t *pPacketInfo,
+                          MQTTDeserializedInfo_t *pDeserializedInfo)
 {
     ESP_LOGI(TAG, "MQTT Event: Packet Type=%d", pPacketInfo->type);
     
@@ -90,13 +98,49 @@ static void eventCallback(MQTTContext_t *pContext,
         case MQTT_PACKET_TYPE_PUBLISH:
             ESP_LOGI(TAG, "=== MQTT PUBLISH RECEIVED ===");
             if (pDeserializedInfo && pDeserializedInfo->pPublishInfo) {
-                ESP_LOGI(TAG, "Topic: %.*s", 
-                         pDeserializedInfo->pPublishInfo->topicNameLength,
-                         pDeserializedInfo->pPublishInfo->pTopicName);
-                ESP_LOGI(TAG, "Payload: %.*s", 
-                         pDeserializedInfo->pPublishInfo->payloadLength,
-                         (char *)pDeserializedInfo->pPublishInfo->pPayload);
-                ESP_LOGI(TAG, "QoS: %d", pDeserializedInfo->pPublishInfo->qos);
+
+                const char *topic = (const char *)pDeserializedInfo->pPublishInfo->pTopicName;
+                uint16_t topicLen = pDeserializedInfo->pPublishInfo->topicNameLength;
+                const char *payload = (const char *)pDeserializedInfo->pPublishInfo->pPayload;
+                uint16_t payloadLen = pDeserializedInfo->pPublishInfo->payloadLength;
+                
+                // Kontrola RGB-a
+                if (strncmp(topic, "esp32/rgb", topicLen) == 0) {
+                    if (strncmp(payload, "R", payloadLen) == 0) control_rgb(255, 0, 0);
+                    else if (strncmp(payload, "G", payloadLen) == 0) control_rgb(0, 255, 0);
+                    else if (strncmp(payload, "B", payloadLen) == 0) control_rgb(0, 0, 255);
+                    else if (strncmp(payload, "OFF", payloadLen) == 0) control_rgb(0, 0, 0);
+                    
+                    // Samo digni zastavicu za ACK
+                    g_send_ack = true;
+                }
+
+                // Kontrola zvučnika
+                else if (strncmp(topic, "esp32/speaker", topicLen) == 0) {
+                    if (strncmp(payload, "GREEN", payloadLen) == 0) {
+                        play_speaker_tone(1000, 200);
+                    } 
+                    else if (strncmp(payload, "RED", payloadLen) == 0) {
+                        play_speaker_tone(1000, 400);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        play_speaker_tone(1000, 400);
+                    } 
+                    else if (strncmp(payload, "BLUE", payloadLen) == 0) {
+                        for (int i = 0; i < 3; i++) {
+                            play_speaker_tone(1000, 100);
+                            if (i < 2) vTaskDelay(pdMS_TO_TICKS(100));
+                        }
+                    }
+                    
+                    // Samo digni zastavicu za ACK
+                    g_send_ack = true;
+                }
+                
+                // Zahtjev za očitavanje senzora (Pull)
+                else if (strncmp(topic, "esp32/sensors/request", topicLen) == 0) {
+                    // Samo digni zastavicu za senzore
+                    g_send_sensors = true;
+                }
             }
             break;
             
@@ -149,227 +193,303 @@ void combined_quic_mqtt_task(void *pvParameters)
         return;
     }
 
-    ESP_LOGI(TAG, "Starting combined QUIC+MQTT task");
-    ESP_LOGI(TAG, "Free heap at task start: %lu bytes", esp_get_free_heap_size());
-    
-    // Convert port to string for QUIC config
-    static char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", serverInfo->port);
-    
-    // Prepare QUIC client configuration
-    quic_client_config_t quic_config = {
-        .hostname = serverInfo->pHostName,
-        .port = port_str,
-        .alpn = serverInfo->pAlpn
-    };
-
-    ESP_LOGI(TAG, "Initializing QUIC client with %s:%s", quic_config.hostname, quic_config.port);
-    ESP_LOGI(TAG, "Free heap before QUIC init: %lu bytes", esp_get_free_heap_size());
-    
-    // Initialize QUIC client (non-blocking)
-    if (quic_client_init_with_config(&quic_config) != 0) {
-        ESP_LOGE(TAG, "Failed to initialize QUIC client");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "QUIC client initialized, waiting for connection...");
-    ESP_LOGI(TAG, "Free heap after QUIC init: %lu bytes", esp_get_free_heap_size());
-    
-    // Wait for QUIC connection to be established
-    int connection_attempts = 0;
-    const int max_attempts = 200; // 20 seconds at 100ms intervals
-    
-    while (!quic_client_is_connected() && connection_attempts < max_attempts) {
-        // Process QUIC events
-        if (quic_client_process() != 0) {
-            ESP_LOGE(TAG, "QUIC client process failed");
-            break;
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        connection_attempts++;
-        
-        // Reset watchdog periodically
-        if (connection_attempts % 5 == 0) {
-            // Just delay to prevent watchdog trigger
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        
-        if (connection_attempts % 20 == 0) {
-            ESP_LOGI(TAG, "Still waiting for QUIC connection... (%d/20s)", connection_attempts/20);
-        }
-    }
-
-    if (!quic_client_is_connected()) {
-        ESP_LOGE(TAG, "Failed to establish QUIC connection after %d attempts", max_attempts);
-        quic_client_cleanup();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "QUIC connection established! Waiting a bit more for stability...");
-
-    // Wait a bit more to ensure connection is stable
-    // why this is needed?
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    connection_attempts = 0;
-    while(!quic_client_local_stream_avail())
-    {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ESP_LOGI(TAG, "Still waiting for QUIC streams... ");
-    }
-    
-    // MQTT client setup
-    MQTTContext_t mqttContext;
-    MQTTStatus_t mqttStatus;
-    NetworkContext_t networkContext;
-    MQTTQUICConfig_t mqttQuicConfig = {
-        .timeoutMs = 5000,
-        .nonBlocking = false
-    };
-    
-    // Initialize the transport layer
-    BaseType_t transportStatus = mqtt_quic_transport_init(&networkContext, serverInfo, &mqttQuicConfig);
-    if (transportStatus != pdPASS) {
-        ESP_LOGE(TAG, "Failed to initialize transport");
-        quic_client_cleanup();
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    // Set up the transport interface structure for core MQTT
-    extern TransportInterface_t xTransportInterface;
-    xTransportInterface.pNetworkContext = &networkContext;
-    xTransportInterface.recv = mqtt_quic_transport_recv;
-    xTransportInterface.send = mqtt_quic_transport_send;
-    
-    // Initialize MQTT library
-    // @FIXME: this buffer isn't thread safe.
-    MQTTFixedBuffer_t networkBuffer;
-    networkBuffer.pBuffer = gbuffer;
-    networkBuffer.size = sizeof(gbuffer);
-    
-    ESP_LOGD(TAG, "Free heap before MQTT init: %lu bytes", esp_get_free_heap_size());
-    
-    extern uint32_t mqtt_get_time_ms(void);
-    mqttStatus = MQTT_Init(&mqttContext,
-                          &xTransportInterface,
-                          mqtt_get_time_ms,
-                          eventCallback,
-                          &networkBuffer);
-                          
-    if (mqttStatus != MQTTSuccess) {
-        ESP_LOGE(TAG, "Failed to initialize MQTT, error %d", mqttStatus);
-        quic_client_cleanup();
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "MQTT initialized, connecting to broker...");
-
-    // Connect to the MQTT broker
-    MQTTConnectInfo_t connectInfo;
-    memset(&connectInfo, 0, sizeof(connectInfo));
-    connectInfo.cleanSession = true;
-    connectInfo.pClientIdentifier = "esp32_quic_client";
-    connectInfo.clientIdentifierLength = strlen("esp32_quic_client");
-    
-    // Add more debugging before MQTT connect
-    ESP_LOGI(TAG, "About to call MQTT_Connect with:");
-    ESP_LOGI(TAG, "  Client ID: %s", connectInfo.pClientIdentifier);
-    ESP_LOGI(TAG, "  Clean session: %s", connectInfo.cleanSession ? "true" : "false");
-    ESP_LOGI(TAG, "  QUIC connected: %s", quic_client_is_connected() ? "true" : "false");
-    ESP_LOGI(TAG, "  Free heap: %lu bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "Calling MQTT_Connect with tieout...");
-    
-    bool sessionPresent = false;
-    
-    // Use a shorter timeout for MQTT connect to prevent watchdog
-    mqttStatus = MQTT_Connect(&mqttContext, &connectInfo, NULL, 5000, &sessionPresent);
-    
-    ESP_LOGI(TAG, "MQTT_Connect returned: %d, sessionPresent: %s", mqttStatus, sessionPresent ? "true" : "false");
-    if (mqttStatus != MQTTSuccess) {
-        ESP_LOGE(TAG, "Failed to connect to MQTT broker, error %d", mqttStatus);
-        quic_client_cleanup();
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Connected to MQTT broker over QUIC!");
-    
-    // Give some time for CONNACK to be processed
-    ESP_LOGI(TAG, "Waiting for CONNACK processing...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Subscribe to a topic
-    MQTTSubscribeInfo_t subscribeInfo;
-    subscribeInfo.qos = MQTTQoS0;
-    subscribeInfo.pTopicFilter = "esp32/quic/test";
-    subscribeInfo.topicFilterLength = strlen("esp32/quic/test");
-    
-    mqttStatus = MQTT_Subscribe(&mqttContext, &subscribeInfo, 1, 2);
-    if (mqttStatus != MQTTSuccess) {
-        ESP_LOGE(TAG, "Failed to subscribe to topic, error %d", mqttStatus);
-    } else {
-        ESP_LOGI(TAG, "Subscribed to topic esp32/quic/test");
-    }
-    
-    // Publish a message
-    MQTTPublishInfo_t publishInfo;
-    memset(&publishInfo, 0, sizeof(publishInfo));
-    publishInfo.qos = MQTTQoS0;
-    publishInfo.pTopicName = "esp32/quic/test";
-    publishInfo.topicNameLength = strlen("esp32/quic/test");
-    publishInfo.pPayload = "Hello from ESP32 over MQTT+QUIC!";
-    publishInfo.payloadLength = strlen("Hello from ESP32 over MQTT+QUIC!");
-    
-    mqttStatus = MQTT_Publish(&mqttContext, &publishInfo, 3);
-    if (mqttStatus != MQTTSuccess) {
-        ESP_LOGE(TAG, "Failed to publish message, error %d", mqttStatus);
-    } else {
-        ESP_LOGI(TAG, "Published message to esp32/quic/test");
-    }
-    
-    // Main loop - process both QUIC and MQTT
-    ESP_LOGI(TAG, "Entering main processing loop...");
-    int loop_count = 0;
+    // Vanjska petlja za automatski reconnect
     while (1) {
-        // Prevent watchdog trigger with regular delays
-        vTaskDelay(pdMS_TO_TICKS(20));  // Increased delay to reduce processing frequency
-        loop_count++;
+        ESP_LOGI(TAG, "Starting combined QUIC+MQTT task (or Reconnecting...)");
+        ESP_LOGI(TAG, "Free heap at task start: %lu bytes", esp_get_free_heap_size());
         
-        // Process QUIC events less frequently to avoid overwhelming ngtcp2
-        if (loop_count % 25 == 0) {  // Process QUIC every 25 iterations (every 500ms)
-            if (quic_client_process() != 0) {
-                ESP_LOGW(TAG, "QUIC client process failed");
-                // Don't break immediately on failure, give it another chance
-                vTaskDelay(pdMS_TO_TICKS(100));
+        // Convert port to string for QUIC config
+        static char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", serverInfo->port);
+        
+        // Prepare QUIC client configuration
+        quic_client_config_t quic_config = {
+            .hostname = serverInfo->pHostName,
+            .port = port_str,
+            .alpn = serverInfo->pAlpn
+        };
+
+        ESP_LOGI(TAG, "Initializing QUIC client with %s:%s", quic_config.hostname, quic_config.port);
+        ESP_LOGI(TAG, "Free heap before QUIC init: %lu bytes", esp_get_free_heap_size());
+        
+        // Initialize QUIC client (non-blocking)
+        if (quic_client_init_with_config(&quic_config) != 0) {
+            ESP_LOGE(TAG, "Failed to initialize QUIC client. Waiting 5s before retry...");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "QUIC client initialized, waiting for connection...");
+        ESP_LOGI(TAG, "Free heap after QUIC init: %lu bytes", esp_get_free_heap_size());
+        
+        // Wait for QUIC connection to be established
+        int connection_attempts = 0;
+        const int max_attempts = 200; // 20 seconds at 100ms intervals
+        
+        while (!quic_client_is_connected() && connection_attempts < max_attempts) {
+            // Process QUIC events
+            int quic_process_result = 0;
+        
+            if (g_quic_mutex != NULL) {
+                xSemaphoreTake(g_quic_mutex, portMAX_DELAY);
+                quic_process_result = quic_client_process();
+                xSemaphoreGive(g_quic_mutex);
+            } else {
+                quic_process_result = quic_client_process();
+            }
+
+            if (quic_process_result != 0) {
+                ESP_LOGW(TAG, "QUIC client process failed - Breaking inner loop...");
+                break; 
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            connection_attempts++;
+            
+            // Reset watchdog periodically
+            if (connection_attempts % 5 == 0) {
+                // Just delay to prevent watchdog trigger
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            
+            if (connection_attempts % 20 == 0) {
+                ESP_LOGI(TAG, "Still waiting for QUIC connection... (%d/20s)", connection_attempts/20);
             }
         }
+
+        if (!quic_client_is_connected()) {
+            ESP_LOGE(TAG, "Failed to establish QUIC connection after %d attempts", max_attempts);
+            quic_client_cleanup();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "QUIC connection established! Waiting a bit more for stability...");
+
+        // Wait a bit more to ensure connection is stable
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        connection_attempts = 0;
+        while(!quic_client_local_stream_avail())
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGI(TAG, "Still waiting for QUIC streams... ");
+        }
         
-        // Process MQTT events more frequently to catch all incoming messages
-        if (loop_count % 5 == 0) {  // Process MQTT every 5 iterations (every 100ms)
+        // MQTT client setup
+        MQTTContext_t mqttContext;
+        MQTTStatus_t mqttStatus;
+        NetworkContext_t networkContext;
+        MQTTQUICConfig_t mqttQuicConfig = {
+            .timeoutMs = 5000,
+            .nonBlocking = false
+        };
+        
+        // Initialize the transport layer
+        BaseType_t transportStatus = mqtt_quic_transport_init(&networkContext, serverInfo, &mqttQuicConfig);
+        if (transportStatus != pdPASS) {
+            ESP_LOGE(TAG, "Failed to initialize transport");
+            quic_client_cleanup();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        // Set up the transport interface structure for core MQTT
+        extern TransportInterface_t xTransportInterface;
+        xTransportInterface.pNetworkContext = &networkContext;
+        xTransportInterface.recv = mqtt_quic_transport_recv;
+        xTransportInterface.send = mqtt_quic_transport_send;
+        
+        // Initialize MQTT library
+        MQTTFixedBuffer_t networkBuffer;
+        networkBuffer.pBuffer = gbuffer;
+        networkBuffer.size = sizeof(gbuffer);
+        
+        ESP_LOGD(TAG, "Free heap before MQTT init: %lu bytes", esp_get_free_heap_size());
+        
+        extern uint32_t mqtt_get_time_ms(void);
+        mqttStatus = MQTT_Init(&mqttContext,
+                               &xTransportInterface,
+                               mqtt_get_time_ms,
+                               eventCallback,
+                               &networkBuffer);
+                               
+        if (mqttStatus != MQTTSuccess) {
+            ESP_LOGE(TAG, "Failed to initialize MQTT, error %d", mqttStatus);
+            quic_client_cleanup();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        ESP_LOGI(TAG, "MQTT initialized, connecting to broker...");
+
+        // Connect to the MQTT broker
+        MQTTConnectInfo_t connectInfo;
+        memset(&connectInfo, 0, sizeof(connectInfo));
+        connectInfo.cleanSession = false;
+        connectInfo.pClientIdentifier = "esp32_quic_client";
+        connectInfo.clientIdentifierLength = strlen("esp32_quic_client");
+        // Postavljanje maksimalnog vremena neaktivnosti radi sprječavanja neželjenog prekida veze
+        connectInfo.keepAliveSeconds = 30;
+        
+        ESP_LOGI(TAG, "Calling MQTT_Connect with timeout...");
+        
+        bool sessionPresent = false;
+        
+        // Use a shorter timeout for MQTT connect to prevent watchdog
+        mqttStatus = MQTT_Connect(&mqttContext, &connectInfo, NULL, 5000, &sessionPresent);
+        
+        ESP_LOGI(TAG, "MQTT_Connect returned: %d, sessionPresent: %s", mqttStatus, sessionPresent ? "true" : "false");
+        if (mqttStatus != MQTTSuccess) {
+            ESP_LOGE(TAG, "Failed to connect to MQTT broker, error %d", mqttStatus);
+            quic_client_cleanup();
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        ESP_LOGI(TAG, "Connected to MQTT broker over QUIC!");
+        
+        // Give some time for CONNACK to be processed
+        ESP_LOGI(TAG, "Waiting for CONNACK processing...");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        // Preplate na teme
+        MQTTSubscribeInfo_t subscribeInfo[4];
+        
+        subscribeInfo[0].qos = MQTTQoS0;
+        subscribeInfo[0].pTopicFilter = "esp32/quic/test";
+        subscribeInfo[0].topicFilterLength = strlen("esp32/quic/test");
+
+        subscribeInfo[1].qos = MQTTQoS0;
+        subscribeInfo[1].pTopicFilter = "esp32/rgb";
+        subscribeInfo[1].topicFilterLength = strlen("esp32/rgb");
+
+        subscribeInfo[2].qos = MQTTQoS0;
+        subscribeInfo[2].pTopicFilter = "esp32/speaker";
+        subscribeInfo[2].topicFilterLength = strlen("esp32/speaker");
+
+        subscribeInfo[3].qos = MQTTQoS0;
+        subscribeInfo[3].pTopicFilter = "esp32/sensors/request";
+        subscribeInfo[3].topicFilterLength = strlen("esp32/sensors/request");
+        
+        mqttStatus = MQTT_Subscribe(&mqttContext, subscribeInfo, 4, 2); // Paket ID = 2
+        
+        // Publish a startup message
+        MQTTPublishInfo_t publishInfo;
+        memset(&publishInfo, 0, sizeof(publishInfo));
+        publishInfo.qos = MQTTQoS0;
+        publishInfo.pTopicName = "esp32/quic/test";
+        publishInfo.topicNameLength = strlen("esp32/quic/test");
+        publishInfo.pPayload = "Hello from ESP32 over MQTT+QUIC!";
+        publishInfo.payloadLength = strlen("Hello from ESP32 over MQTT+QUIC!");
+        
+        mqttStatus = MQTT_Publish(&mqttContext, &publishInfo, 0);
+        if (mqttStatus != MQTTSuccess) {
+            ESP_LOGE(TAG, "Failed to publish message, error %d", mqttStatus);
+        } else {
+            ESP_LOGI(TAG, "Published message to esp32/quic/test");
+        }
+        
+        // Unutarnja radna petlja
+        ESP_LOGI(TAG, "Entering main processing loop...");
+        int loop_count = 0;
+        char sensor_payload[128]; 
+        bool last_button_state = false;
+        uint32_t last_button_press_time = 0;
+
+        while (1) {
+            // Osnovna pauza (20ms)
+            vTaskDelay(pdMS_TO_TICKS(20)); 
+            loop_count++;
+
+            int inner_quic_process_result = 0;
+            
+            if (g_quic_mutex != NULL) {
+                xSemaphoreTake(g_quic_mutex, portMAX_DELAY);
+                inner_quic_process_result = quic_client_process();
+                xSemaphoreGive(g_quic_mutex);
+            } else {
+                inner_quic_process_result = quic_client_process();
+            }
+
+            if (inner_quic_process_result != 0) {
+                ESP_LOGW(TAG, "QUIC client process failed - Breaking inner loop...");
+                break;
+            }
+
+            // Provjera dolazne poruke
             mqttStatus = MQTT_ProcessLoop(&mqttContext);
             if (mqttStatus != MQTTSuccess) {
-                ESP_LOGW(TAG, "MQTT process loop failed, error %d", mqttStatus);
+                ESP_LOGW(TAG, "MQTT loop failed, error %d", mqttStatus);
+                if(mqttStatus == MQTTKeepAliveTimeout) break; 
+            }
+
+            if (g_send_ack) {
+                MQTTPublishInfo_t ackInfo = {
+                    .qos = MQTTQoS0,
+                    .pTopicName = "esp32/ack",
+                    .topicNameLength = strlen("esp32/ack"),
+                    .pPayload = "OK",
+                    .payloadLength = 2
+                };
+                MQTT_Publish(&mqttContext, &ackInfo, 0);
+                g_send_ack = false; 
+            }
+
+            // Slanje senzora na zahtjev
+            if (g_send_sensors) {
+                float temp, hum;
+                if (read_temp_humidity(&temp, &hum)) {
+                    snprintf(sensor_payload, sizeof(sensor_payload), 
+                             "{\"temperature\": %.1f, \"humidity\": %.1f}", 
+                             temp, hum);
+                    
+                    MQTTPublishInfo_t pubInfo = {
+                        .qos = MQTTQoS0,
+                        .pTopicName = "esp32/sensors",
+                        .topicNameLength = strlen("esp32/sensors"),
+                        .pPayload = sensor_payload,
+                        .payloadLength = strlen(sensor_payload)
+                    };
+                    MQTT_Publish(&mqttContext, &pubInfo, 0);
+                    ESP_LOGI(TAG, "Poslani podaci senzora na zahtjev.");
+                }
+                g_send_sensors = false; 
+            }
+
+            // Tipka 
+            bool current_button_state = is_button_pressed();
+            uint32_t current_time = esp_timer_get_time() / 1000; 
+
+            if (current_button_state && !last_button_state) {
+                if (current_time - last_button_press_time > 200) { 
+                    last_button_press_time = current_time;
+                    last_button_state = true;
+                    
+                    MQTTPublishInfo_t pubInfoBtn = {
+                        .qos = MQTTQoS0,
+                        .pTopicName = "esp32/button",
+                        .topicNameLength = strlen("esp32/button"),
+                        .pPayload = "TRIGGER_AI",
+                        .payloadLength = strlen("TRIGGER_AI")
+                    };
+                    MQTT_Publish(&mqttContext, &pubInfoBtn, 0); 
+                    ESP_LOGI(TAG, "Gumb pritisnut");
+                }
+            } else if (!current_button_state) {
+                last_button_state = false;
+            }
+
+            // Provjera je li QUIC još živ
+            if (!quic_client_is_connected()) {
+                ESP_LOGW(TAG, "QUIC connection lost");
+                break;
             }
         }
-        
-        // Check if QUIC connection is still alive
-        if (!quic_client_is_connected()) {
-            ESP_LOGW(TAG, "QUIC connection lost");
-            break;
-        }
-        
-        // Check free heap every 50 iterations
-        if (loop_count % 50 == 0) {
-            ESP_LOGD(TAG, "Free heap: %lu bytes (loop %d)", esp_get_free_heap_size(), loop_count);
-        }
+
+        // Cleanup nakon pucanja veze
+        ESP_LOGI(TAG, "Cleaning up QUIC and waiting 5s before reconnect...");
+        quic_client_cleanup();
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
-    
-    ESP_LOGI(TAG, "Cleaning up and exiting...");
-    quic_client_cleanup();
-    vTaskDelete(NULL);
 }
 
 void wifi_init(void)
@@ -395,8 +515,9 @@ void wifi_init(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Initializing...");
+
+    hardware_init();
     
-    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -417,9 +538,9 @@ void app_main(void)
     
     // Create server info for QUIC client
     static ServerInfo_t serverInfo = {
-        .pHostName = "broker.emqx.io",
+        .pHostName = "192.168.1.121", 
         .port = 14567,
-        .pAlpn = "mqtt"  // Use plain string instead of binary format
+        .pAlpn = "mqtt"
     };
     
     // Run the combined QUIC+MQTT task with smaller stack
@@ -428,4 +549,18 @@ void app_main(void)
     while (1) {
          vTaskDelay(10000 / portTICK_PERIOD_MS); // Yield to other tasks
     }
+}
+
+// Fix za wolfsll linker error
+#include "wolfssl/wolfcrypt/settings.h"
+#include "wolfssl/ssl.h"
+
+WOLFSSL_SESSION* TlsSessionCacheGetAndRdLock(const unsigned char* id, int len) {
+    (void)id;
+    (void)len;
+    return NULL; 
+}
+
+void TlsSessionCacheUnlockRow(const unsigned char* id) {
+    (void)id;
 }

@@ -36,6 +36,10 @@
 #include <errno.h>
 #include <assert.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+extern SemaphoreHandle_t g_quic_mutex; 
+
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_wolfssl.h>
@@ -72,7 +76,7 @@ static const char *TAG = "QUIC";
  * and undefine MESSAGE macro.
  */
 
-#define REMOTE_HOST "127.0.0.1"
+#define REMOTE_HOST "192.168.1.121"
 #define REMOTE_PORT "14567"
 #define ALPN "\x4mqtt"
 struct client g_client;  // Make the client struct global
@@ -627,13 +631,25 @@ static void timer_cb(struct ev_loop *loop, ev_timer *w, int revents) {
   (void)loop;
   (void)revents;
 
+  if (g_quic_mutex != NULL) {
+      xSemaphoreTake(g_quic_mutex, portMAX_DELAY);
+  }
+
   if (client_handle_expiry(c) != 0) {
     client_close(c);
+    
+    if (g_quic_mutex != NULL) {
+        xSemaphoreGive(g_quic_mutex);
+    }
     return;
   }
 
   if (client_write(c) != 0) {
     client_close(c);
+  }
+
+  if (g_quic_mutex != NULL) {
+      xSemaphoreGive(g_quic_mutex);
   }
 }
 
